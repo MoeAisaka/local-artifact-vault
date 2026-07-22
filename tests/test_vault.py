@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,23 @@ class VaultTests(unittest.TestCase):
         path, record = self.vault.resolve(result["artifactId"], result["expiresAt"], result["signature"], now=result["expiresAt"] - 1)
         self.assertEqual(path.read_text(encoding="utf-8"), "safe report\n")
         self.assertEqual(record["name"], "report.txt")
+        self.assertEqual(record["mimeType"], "text/plain")
         self.assertTrue(result["url"].startswith("https://example.invalid/artifacts/download/"))
+
+    def test_audit_is_owner_only_and_never_records_signature_or_source_content(self):
+        result = self.vault.publish(self.source, ttl_seconds=60)
+        with self.assertRaises(VaultError):
+            self.vault.resolve(result["artifactId"], result["expiresAt"], "0" * 64)
+        events = [
+            json.loads(line)
+            for line in self.vault.audit_file.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([event["event"] for event in events], ["published", "resolve_rejected"])
+        audit_text = self.vault.audit_file.read_text(encoding="utf-8")
+        self.assertNotIn(result["signature"], audit_text)
+        self.assertNotIn(str(self.source), audit_text)
+        self.assertNotIn("safe report", audit_text)
+        self.assertEqual(os.stat(self.vault.audit_file).st_mode & 0o777, 0o600)
 
     def test_bad_signature_is_rejected(self):
         result = self.vault.publish(self.source, ttl_seconds=60)
