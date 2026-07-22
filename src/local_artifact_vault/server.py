@@ -10,7 +10,7 @@ from .vault import Vault, VaultError
 
 def handler_for(vault: Vault):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "LocalArtifactVault/0.1"
+        server_version = "LocalArtifactVault/0.2"
 
         def do_GET(self):  # noqa: N802
             parsed = urlsplit(self.path)
@@ -30,7 +30,7 @@ def handler_for(vault: Vault):
             data = path.read_bytes()
             encoded_name = quote(str(record["name"]), safe="")
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", str(record.get("mimeType") or "application/octet-stream"))
             self.send_header("Content-Disposition", f"attachment; filename=artifact; filename*=UTF-8''{encoded_name}")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "private, no-store")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -53,12 +54,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _append_jsonl(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if path.exists():
+            os.chmod(path, 0o600)
+
+
 class Vault:
     def __init__(self, root: Path | str, *, max_bytes: int = 100 * 1024 * 1024, scan_bytes: int = 2 * 1024 * 1024):
         self.root = Path(root).expanduser().resolve()
         self.objects = self.root / "objects"
         self.records = self.root / "records"
         self.secret_file = self.root / "signing-secret"
+        self.audit_file = self.root / "audit.jsonl"
         self.max_bytes = max_bytes
         self.scan_bytes = scan_bytes
 
@@ -84,6 +99,20 @@ class Vault:
         if not ID_RE.fullmatch(artifact_id):
             raise VaultError("invalid artifact id")
         return self.records / f"{artifact_id}.json"
+
+    def _audit(self, event: str, *, artifact_id: str | None = None, reason: str | None = None, **details) -> None:
+        self.initialize()
+        payload = {"at": int(time.time()), "event": event}
+        if artifact_id and ID_RE.fullmatch(artifact_id):
+            payload["artifactId"] = artifact_id
+        if reason:
+            payload["reason"] = reason
+        payload.update(details)
+        _append_jsonl(self.audit_file, payload)
+
+    def _reject(self, reason: str, artifact_id: str | None = None) -> None:
+        self._audit("resolve_rejected", artifact_id=artifact_id, reason=reason)
+        raise VaultError(reason)
 
     def _scan(self, source: Path) -> None:
         if source.is_symlink() or not source.is_file():
@@ -128,8 +157,15 @@ class Vault:
             "createdAt": int(time.time()),
             "expiresAt": expires,
             "object": artifact_id,
+            "mimeType": mimetypes.guess_type(source_path.name)[0] or "application/octet-stream",
         }
         _atomic_json(self._record_path(artifact_id), record)
+        self._audit(
+            "published",
+            artifact_id=artifact_id,
+            size=int(record["size"]),
+            expiresAt=expires,
+        )
         signature = self.signature(artifact_id, file_hash, expires)
         url = None
         if base_url:
@@ -140,18 +176,19 @@ class Vault:
         current = int(time.time()) if now is None else now
         record_path = self._record_path(artifact_id)
         if not record_path.is_file():
-            raise VaultError("artifact not found")
+            self._reject("artifact not found", artifact_id)
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if expires != int(record["expiresAt"]) or current > expires:
-            raise VaultError("link expired")
+            self._reject("link expired", artifact_id)
         expected = self.signature(artifact_id, str(record["sha256"]), expires)
         if not hmac.compare_digest(expected, signature):
-            raise VaultError("invalid signature")
+            self._reject("invalid signature", artifact_id)
         object_path = (self.objects / str(record["object"])).resolve()
         if object_path.parent != self.objects.resolve() or not object_path.is_file() or object_path.is_symlink():
-            raise VaultError("invalid object path")
+            self._reject("invalid object path", artifact_id)
         if _sha256(object_path) != record["sha256"]:
-            raise VaultError("artifact integrity check failed")
+            self._reject("artifact integrity check failed", artifact_id)
+        self._audit("resolved", artifact_id=artifact_id, size=int(record["size"]))
         return object_path, record
 
     def cleanup(self, *, now: int | None = None) -> int:
@@ -170,4 +207,5 @@ class Vault:
                 removed += 1
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
+        self._audit("cleanup", removed=removed)
         return removed
